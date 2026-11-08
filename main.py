@@ -3,6 +3,9 @@ Photoshop CC Interface Clone in Python using PyQt6
 File: main.py
 Description: A pixel-accurate, fully styled Photo Job interface built with PyQt6.
 Features:
+- Ctrl+Z / Ctrl+Alt+Z: Undo previous step (quay lại bước trước)
+- Ctrl+Shift+Z / Ctrl+Y: Redo next step (làm lại bước kế tiếp)
+- History Panel: Visual history state stack with one-click time travel
 - Ctrl+S shortcut to save image as .dbp / .png / .jpg / .webp / .ico / .bmp
 - Interactive Canvas with real layer composition and drawing support
 - File -> Open (Ctrl+O) to load images or .dbp project files
@@ -26,7 +29,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import (
     QPainter, QColor, QPen, QBrush, QPixmap, QIcon, QFont,
     QLinearGradient, QPolygonF, QPainterPath,
-    QKeySequence, QImage
+    QKeySequence, QImage, QAction
 )
 from PyQt6.QtCore import Qt, QSize, QPoint, QPointF, QRect, QRectF, pyqtSignal, QBuffer, QIODevice, QTimer
 
@@ -1090,6 +1093,7 @@ class PhotoshopOptionsBar(QFrame):
 class PhotoshopCanvas(QWidget):
     """The document canvas simulating Photoshop's 2100 x 1500 px document with live layers & drawing."""
     canvas_updated = pyqtSignal()
+    history_changed = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1118,8 +1122,165 @@ class PhotoshopCanvas(QWidget):
         self.is_drawing = False
         self.last_doc_point = None
 
+        # History / Undo-Redo system (Ctrl+Z)
+        self.undo_stack = []
+        self.redo_stack = []
+        self.current_action_name = "New Document"
+        self.max_undo_steps = 30
+        self._batch_history_update = False
+
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMinimumSize(800, 500)
         self.setStyleSheet(f"background-color: {DARK_PALETTE['bg_darkest']};")
+
+    def _create_snapshot(self, action_name: str) -> dict:
+        layers_copy = []
+        for lyr in self.layers:
+            layers_copy.append({
+                "id": lyr.get("id", ""),
+                "name": lyr.get("name", "Layer"),
+                "visible": lyr.get("visible", True),
+                "opacity": lyr.get("opacity", 1.0),
+                "locked": lyr.get("locked", False),
+                "blend_mode": lyr.get("blend_mode", "Normal"),
+                "image": lyr["image"].copy()
+            })
+        return {
+            "name": action_name,
+            "doc_width": self.doc_width,
+            "doc_height": self.doc_height,
+            "dpi": self.dpi,
+            "active_layer_idx": self.active_layer_idx,
+            "layers": layers_copy
+        }
+
+    def _restore_snapshot(self, snap: dict):
+        self.doc_width = snap["doc_width"]
+        self.doc_height = snap["doc_height"]
+        self.dpi = snap["dpi"]
+        self.active_layer_idx = snap["active_layer_idx"]
+        restored = []
+        for lyr in snap["layers"]:
+            restored.append({
+                "id": lyr["id"],
+                "name": lyr["name"],
+                "visible": lyr["visible"],
+                "opacity": lyr["opacity"],
+                "locked": lyr["locked"],
+                "blend_mode": lyr["blend_mode"],
+                "image": lyr["image"].copy()
+            })
+        self.layers = restored
+        self.update()
+        self.canvas_updated.emit()
+
+    def save_undo_state(self, action_name: str):
+        """Saves current state to undo stack before making a change."""
+        snap = self._create_snapshot(self.current_action_name)
+        self.undo_stack.append(snap)
+        if len(self.undo_stack) > self.max_undo_steps:
+            self.undo_stack.pop(0)
+        self.redo_stack.clear()
+        self.current_action_name = action_name
+        if not self._batch_history_update:
+            self.history_changed.emit()
+
+    def undo(self, emit_signal: bool = True) -> tuple[bool, str]:
+        """Undo step (Ctrl+Z): reverts to previous document state."""
+        if not self.undo_stack:
+            return False, ""
+        self.is_drawing = False
+        self.last_doc_point = None
+        curr = self._create_snapshot(self.current_action_name)
+        self.redo_stack.append(curr)
+        prev = self.undo_stack.pop()
+        undone_action = self.current_action_name
+        self._restore_snapshot(prev)
+        self.current_action_name = prev.get("name", "Step")
+        if emit_signal and not self._batch_history_update:
+            self.history_changed.emit()
+        return True, undone_action
+
+    def redo(self, emit_signal: bool = True) -> tuple[bool, str]:
+        """Redo step (Ctrl+Shift+Z / Ctrl+Y): re-applies undone document state."""
+        if not self.redo_stack:
+            return False, ""
+        self.is_drawing = False
+        self.last_doc_point = None
+        curr = self._create_snapshot(self.current_action_name)
+        self.undo_stack.append(curr)
+        nxt = self.redo_stack.pop()
+        redone_action = nxt.get("name", "Step")
+        self._restore_snapshot(nxt)
+        self.current_action_name = redone_action
+        if emit_signal and not self._batch_history_update:
+            self.history_changed.emit()
+        return True, redone_action
+
+    def can_undo(self) -> bool:
+        return len(self.undo_stack) > 0
+
+    def can_redo(self) -> bool:
+        return len(self.redo_stack) > 0
+
+    def get_undo_name(self) -> str:
+        return self.current_action_name if self.can_undo() else ""
+
+    def get_redo_name(self) -> str:
+        if self.can_redo():
+            return self.redo_stack[-1].get("name", "Step")
+        return ""
+
+    def reset_history(self, initial_name: str = "New Document"):
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+        self.current_action_name = initial_name
+        self.history_changed.emit()
+
+    def get_history_list(self) -> list[tuple[str, str]]:
+        def get_icon(name: str) -> str:
+            n = name.lower()
+            if "brush" in n:
+                return "brush"
+            elif "layer" in n:
+                if "delete" in n:
+                    return "trash"
+                elif "visib" in n:
+                    return "eye"
+                return "new_layer"
+            elif "open" in n or "document" in n or "new" in n:
+                return "home"
+            return "history_brush"
+
+        items = []
+        for s in self.undo_stack:
+            name = s.get("name", "Step")
+            items.append((name, get_icon(name)))
+        items.append((self.current_action_name, get_icon(self.current_action_name)))
+        for s in reversed(self.redo_stack):
+            name = s.get("name", "Step")
+            items.append((name, get_icon(name)))
+        return items
+
+    def get_current_history_index(self) -> int:
+        return len(self.undo_stack)
+
+    def jump_to_history_index(self, target_idx: int):
+        curr_idx = len(self.undo_stack)
+        if target_idx == curr_idx:
+            return
+        self._batch_history_update = True
+        try:
+            if target_idx < curr_idx:
+                for _ in range(curr_idx - target_idx):
+                    self.undo(emit_signal=False)
+            elif target_idx > curr_idx:
+                for _ in range(target_idx - curr_idx):
+                    self.redo(emit_signal=False)
+        finally:
+            self._batch_history_update = False
+            self.history_changed.emit()
+            self.canvas_updated.emit()
 
     def set_brush_color(self, color: QColor):
         self.brush_color = color
@@ -1170,6 +1331,7 @@ class PhotoshopCanvas(QWidget):
             "image": qimg
         }]
         self.active_layer_idx = 0
+        self.reset_history("Open Image")
         self.update()
         self.canvas_updated.emit()
 
@@ -1200,8 +1362,10 @@ class PhotoshopCanvas(QWidget):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            self.setFocus()
             doc_pt = self._view_to_doc(event.position().toPoint())
             if doc_pt:
+                self.save_undo_state("Brush Tool")
                 self.is_drawing = True
                 self.last_doc_point = doc_pt
                 self._draw_stroke(doc_pt, doc_pt)
@@ -1540,14 +1704,19 @@ class LayersPanel(QWidget):
 
             self.layer_list.setItemWidget(item, widget)
 
-        self.layer_list.setCurrentRow(0)
+        if 0 <= self.canvas.active_layer_idx < len(self.canvas.layers):
+            self.layer_list.setCurrentRow(self.canvas.active_layer_idx)
+        else:
+            self.layer_list.setCurrentRow(0)
 
     def _toggle_visibility(self, layer_idx: int, btn_eye: QToolButton):
         if self.canvas and 0 <= layer_idx < len(self.canvas.layers):
+            self.canvas.save_undo_state("Layer Visibility")
             curr = self.canvas.layers[layer_idx].get("visible", True)
             self.canvas.layers[layer_idx]["visible"] = not curr
             btn_eye.setIcon(IconFactory.create_icon("eye", 15, DARK_PALETTE["text_primary"] if not curr else DARK_PALETTE["text_muted"]))
             self.canvas.update()
+            self.canvas.canvas_updated.emit()
 
     def _on_layer_row_changed(self, row: int):
         if self.canvas and 0 <= row < len(self.canvas.layers):
@@ -1556,6 +1725,7 @@ class LayersPanel(QWidget):
     def _create_new_layer(self):
         if not self.canvas:
             return
+        self.canvas.save_undo_state("New Layer")
         idx = len(self.canvas.layers)
         new_img = QImage(self.canvas.doc_width, self.canvas.doc_height, QImage.Format.Format_ARGB32_Premultiplied)
         new_img.fill(QColor(0, 0, 0, 0))
@@ -1572,16 +1742,109 @@ class LayersPanel(QWidget):
         self.canvas.active_layer_idx = 0
         self.rebuild_layer_list()
         self.canvas.update()
+        self.canvas.canvas_updated.emit()
 
     def _delete_selected_layer(self):
         if not self.canvas or len(self.canvas.layers) <= 1:
             return
         row = self.layer_list.currentRow()
         if 0 <= row < len(self.canvas.layers):
+            self.canvas.save_undo_state("Delete Layer")
             del self.canvas.layers[row]
             self.canvas.active_layer_idx = min(row, len(self.canvas.layers) - 1)
             self.rebuild_layer_list()
             self.canvas.update()
+            self.canvas.canvas_updated.emit()
+
+
+class HistoryPanel(QWidget):
+    """Lower panel: History state list matching Photoshop CC with interactive undo/redo navigation."""
+    def __init__(self, parent=None, canvas: PhotoshopCanvas = None):
+        super().__init__(parent)
+        self.canvas = canvas
+        self._updating = False
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 4, 6, 4)
+        layout.setSpacing(4)
+
+        self.history_list = QListWidget(self)
+        self.history_list.setStyleSheet(
+            f"background-color: {DARK_PALETTE['bg_dark']}; border: 1px solid {DARK_PALETTE['border_dark']};"
+        )
+        self.history_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        self.history_list.currentRowChanged.connect(self._on_row_clicked)
+        layout.addWidget(self.history_list, 1)
+
+        # Bottom hint & action bar
+        bottom_bar = QHBoxLayout()
+        bottom_bar.setSpacing(4)
+
+        lbl_hint = QLabel("Ctrl+Z: Undo | Ctrl+Shift+Z: Redo", self)
+        lbl_hint.setStyleSheet(f"color: {DARK_PALETTE['text_muted']}; font-size: 10px;")
+        bottom_bar.addWidget(lbl_hint)
+        bottom_bar.addStretch()
+
+        btn_undo = QToolButton(self)
+        btn_undo.setIcon(IconFactory.create_icon("history_brush", 15, DARK_PALETTE["icon_normal"]))
+        btn_undo.setFixedSize(22, 20)
+        btn_undo.setToolTip("Step Backward (Ctrl+Z)")
+        btn_undo.clicked.connect(lambda: self.canvas.undo() if self.canvas else None)
+        bottom_bar.addWidget(btn_undo)
+
+        btn_trash = QToolButton(self)
+        btn_trash.setIcon(IconFactory.create_icon("trash", 15, DARK_PALETTE["icon_normal"]))
+        btn_trash.setFixedSize(22, 20)
+        btn_trash.setToolTip("Delete State (Undo)")
+        btn_trash.clicked.connect(lambda: self.canvas.undo() if self.canvas else None)
+        bottom_bar.addWidget(btn_trash)
+
+        layout.addLayout(bottom_bar)
+        self.rebuild_history_list()
+
+    def rebuild_history_list(self):
+        if not self.canvas:
+            return
+        self._updating = True
+        self.history_list.clear()
+
+        states = self.canvas.get_history_list()
+        current_idx = self.canvas.get_current_history_index()
+
+        for idx, (name, icon_name) in enumerate(states):
+            item = QListWidgetItem(self.history_list)
+            item.setSizeHint(QSize(200, 26))
+
+            is_current = (idx == current_idx)
+            is_undone = (idx > current_idx)
+
+            color = DARK_PALETTE["accent_cyan"] if is_current else (
+                DARK_PALETTE["text_muted"] if is_undone else DARK_PALETTE["icon_normal"]
+            )
+            item.setIcon(IconFactory.create_icon(icon_name, 15, color))
+            item.setText(f"  {name}")
+
+            if is_current:
+                item.setForeground(QBrush(QColor(DARK_PALETTE["accent_cyan"])))
+                font = item.font()
+                font.setBold(True)
+                item.setFont(font)
+            elif is_undone:
+                item.setForeground(QBrush(QColor(DARK_PALETTE["text_muted"])))
+                font = item.font()
+                font.setItalic(True)
+                item.setFont(font)
+            else:
+                item.setForeground(QBrush(QColor(DARK_PALETTE["text_primary"])))
+
+        if 0 <= current_idx < self.history_list.count():
+            self.history_list.setCurrentRow(current_idx)
+        self._updating = False
+
+    def _on_row_clicked(self, row: int):
+        if self._updating or not self.canvas or row < 0:
+            return
+        self.canvas.jump_to_history_index(row)
 
 
 class PhotoshopDockPanels(QFrame):
@@ -1589,6 +1852,7 @@ class PhotoshopDockPanels(QFrame):
 
     def __init__(self, parent=None, canvas: PhotoshopCanvas = None):
         super().__init__(parent)
+        self.canvas = canvas
         self.setObjectName("DockPanel")
         self.setFixedWidth(280)
 
@@ -1656,10 +1920,12 @@ class PhotoshopDockPanels(QFrame):
         div.setFixedHeight(2)
         pc_layout.addWidget(div)
 
-        # Lower tab widget: Layers, Channels, Paths
+        # Lower tab widget: Layers, History, Channels, Paths
         self.bottom_tabs = QTabWidget(panels_container)
         self.layers_panel = LayersPanel(self, canvas)
+        self.history_panel = HistoryPanel(self, canvas)
         self.bottom_tabs.addTab(self.layers_panel, "Layers")
+        self.bottom_tabs.addTab(self.history_panel, "History")
         self.bottom_tabs.addTab(QWidget(), "Channels")
         self.bottom_tabs.addTab(QWidget(), "Paths")
 
@@ -1671,6 +1937,12 @@ class PhotoshopDockPanels(QFrame):
         pc_layout.addWidget(self.bottom_tabs, 1)
 
         main_layout.addWidget(panels_container, 1)
+
+        # Connect strip buttons & canvas signals
+        btn_hist.clicked.connect(lambda: self.bottom_tabs.setCurrentWidget(self.history_panel))
+        if canvas:
+            canvas.history_changed.connect(self.history_panel.rebuild_history_list)
+            canvas.history_changed.connect(self.layers_panel.rebuild_layer_list)
 
 
 # ==============================================================================
@@ -1730,6 +2002,8 @@ class PhotoshopMainWindow(QMainWindow):
         # Connect toolbar swatches & color panel
         self.toolbar.color_swatch.color_selected.connect(self._on_color_changed)
         self.dock_panels.color_panel.color_selected.connect(self._on_color_changed)
+        self.workspace.canvas.history_changed.connect(self._update_undo_redo_actions)
+        self._update_undo_redo_actions()
 
     def _create_ps_app_icon(self) -> QIcon:
         pm = QPixmap(32, 32)
@@ -1796,10 +2070,17 @@ class PhotoshopMainWindow(QMainWindow):
         f_menu.addSeparator()
         f_menu.addAction("Exit", self.close).setShortcut(QKeySequence.StandardKey.Quit)
 
-        # Populate Edit menu
+        # Populate Edit menu with Ctrl+Z Undo / Redo
         e_menu = menus["Edit"]
-        e_menu.addAction("Undo").setShortcut(QKeySequence.StandardKey.Undo)
-        e_menu.addAction("Redo").setShortcut(QKeySequence.StandardKey.Redo)
+        self.act_undo = e_menu.addAction("Undo")
+        self.act_undo.setShortcuts([QKeySequence("Ctrl+Z"), QKeySequence("Ctrl+Alt+Z")])
+        self.act_undo.triggered.connect(self.action_undo)
+        self.addAction(self.act_undo)
+
+        self.act_redo = e_menu.addAction("Redo")
+        self.act_redo.setShortcuts([QKeySequence("Ctrl+Shift+Z"), QKeySequence("Ctrl+Y")])
+        self.act_redo.triggered.connect(self.action_redo)
+        self.addAction(self.act_redo)
         e_menu.addSeparator()
         e_menu.addAction("Cut").setShortcut(QKeySequence.StandardKey.Cut)
         e_menu.addAction("Copy").setShortcut(QKeySequence.StandardKey.Copy)
@@ -1843,6 +2124,65 @@ class PhotoshopMainWindow(QMainWindow):
         self.workspace.canvas.set_brush_color(color)
 
     # --------------------------------------------------------------------------
+    # UNDO / REDO & EDIT LOGIC (Ctrl+Z / Ctrl+Shift+Z)
+    # --------------------------------------------------------------------------
+
+    def action_undo(self):
+        """Undo last step (Ctrl+Z / Ctrl+Alt+Z)."""
+        success, action_name = self.workspace.canvas.undo()
+        if success:
+            self.workspace.show_status_message(f"↩ Undo: {action_name} (Ctrl+Z)")
+        else:
+            self.workspace.show_status_message("Nothing to undo")
+
+    def action_redo(self):
+        """Redo next step (Ctrl+Shift+Z / Ctrl+Y)."""
+        success, action_name = self.workspace.canvas.redo()
+        if success:
+            self.workspace.show_status_message(f"↪ Redo: {action_name} (Ctrl+Shift+Z)")
+        else:
+            self.workspace.show_status_message("Nothing to redo")
+
+    def _update_undo_redo_actions(self):
+        """Updates Edit menu texts and enabled state based on history."""
+        canvas = self.workspace.canvas
+        if canvas.can_undo():
+            self.act_undo.setEnabled(True)
+            self.act_undo.setText(f"Undo {canvas.get_undo_name()}\tCtrl+Z")
+        else:
+            self.act_undo.setEnabled(False)
+            self.act_undo.setText("Undo\tCtrl+Z")
+
+        if canvas.can_redo():
+            self.act_redo.setEnabled(True)
+            self.act_redo.setText(f"Redo {canvas.get_redo_name()}\tCtrl+Shift+Z")
+        else:
+            self.act_redo.setEnabled(False)
+            self.act_redo.setText("Redo\tCtrl+Shift+Z")
+
+    def keyPressEvent(self, event):
+        """Window-level fallback shortcut handler for Ctrl+Z, Ctrl+Shift+Z, Ctrl+Y."""
+        modifiers = event.modifiers()
+        key = event.key()
+
+        if modifiers == Qt.KeyboardModifier.ControlModifier:
+            if key == Qt.Key.Key_Z:
+                self.action_undo()
+                event.accept()
+                return
+            elif key == Qt.Key.Key_Y:
+                self.action_redo()
+                event.accept()
+                return
+        elif modifiers == (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier):
+            if key == Qt.Key.Key_Z:
+                self.action_redo()
+                event.accept()
+                return
+
+        super().keyPressEvent(event)
+
+    # --------------------------------------------------------------------------
     # SAVE & EXPORT LOGIC (.dbp / .png / .jpg / .webp / .ico / .bmp)
     # --------------------------------------------------------------------------
 
@@ -1864,6 +2204,7 @@ class PhotoshopMainWindow(QMainWindow):
             "image": bg_image
         }]
         self.workspace.canvas.active_layer_idx = 0
+        self.workspace.canvas.reset_history("New Document")
         self.dock_panels.layers_panel.rebuild_layer_list()
         self.workspace.set_document_name("Untitled-1")
         self.setWindowTitle("Photo Job")
@@ -1887,6 +2228,7 @@ class PhotoshopMainWindow(QMainWindow):
             return
 
         try:
+            filename = os.path.basename(file_path)
             ext = os.path.splitext(file_path)[1].lower()
             if ext == ".dbp":
                 self._load_dbp_project(file_path)
@@ -1895,8 +2237,8 @@ class PhotoshopMainWindow(QMainWindow):
                 self.workspace.canvas.load_from_pil(pil_img)
 
             self.current_file_path = file_path
-            filename = os.path.basename(file_path)
             self.doc_name = os.path.splitext(filename)[0]
+            self.workspace.canvas.reset_history(f"Open: {filename}")
             self.workspace.set_document_name(filename)
             self.setWindowTitle(f"{filename} - Photo Job")
             self.dock_panels.layers_panel.rebuild_layer_list()
@@ -2084,6 +2426,7 @@ class PhotoshopMainWindow(QMainWindow):
 
             self.workspace.canvas.layers = new_layers
             self.workspace.canvas.active_layer_idx = 0
+            self.workspace.canvas.reset_history(f"Open: {os.path.basename(file_path)}")
             self.workspace.canvas.update()
 
 
